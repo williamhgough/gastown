@@ -217,9 +217,10 @@ func parseBeadContext(beadID string) (actor, rig, role string) {
 
 // GtEventsSource reads events from ~/gt/.events.jsonl (gt activity log)
 type GtEventsSource struct {
-	file   *os.File
+	tailer *eventTailer
 	events chan Event
 	cancel context.CancelFunc
+	done   chan struct{} // closed once tail has returned and released the file
 }
 
 // GtEvent is the structure of events in .events.jsonl
@@ -243,9 +244,10 @@ func NewGtEventsSource(townRoot string) (*GtEventsSource, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	source := &GtEventsSource{
-		file:   file,
+		tailer: newEventTailer(eventsPath, file),
 		events: make(chan Event, 200),
 		cancel: cancel,
+		done:   make(chan struct{}),
 	}
 
 	go source.tail(ctx)
@@ -253,19 +255,21 @@ func NewGtEventsSource(townRoot string) (*GtEventsSource, error) {
 	return source, nil
 }
 
-// tail loads recent history then follows the file for new events.
+// tail loads recent history then follows the file for new events. The tailer
+// follows by path, so the feed keeps updating after gt krc prune renames a new
+// file over .events.jsonl.
 func (s *GtEventsSource) tail(ctx context.Context) {
+	defer close(s.done)
 	defer close(s.events)
+	defer s.tailer.close()
 
 	// Load recent events (last 200 lines) for initial display
 	s.loadRecentEvents()
 
-	// Seek to true EOF so the tail scanner starts cleanly,
-	// regardless of the preload scanner's internal read-ahead buffer.
-	_, _ = s.file.Seek(0, 2)
+	// The preload scan ran to EOF, so the file offset is already where tailing
+	// starts. Seeking to the end here would skip anything appended since.
+	s.tailer.resumeAtOffsetOf(s.tailer.file)
 
-	// Now tail for new events
-	scanner := bufio.NewScanner(s.file)
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -274,25 +278,28 @@ func (s *GtEventsSource) tail(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			for scanner.Scan() {
-				line := scanner.Text()
-				if event := parseGtEventLine(line); event != nil {
-					select {
-					case s.events <- *event:
-					default:
-					}
+			err := s.tailer.poll(func(event Event) {
+				select {
+				case s.events <- event:
+				case <-ctx.Done():
 				}
+			})
+			if err != nil {
+				return
 			}
 		}
 	}
 }
 
-// loadRecentEvents reads the last N lines of the file and emits them as events.
-// Uses a ring buffer so memory is O(maxLines) regardless of file size.
+// loadRecentEvents reads the whole file, emits the last N lines as events and
+// tells the tailer about every line, so a later replace of the file does not
+// replay history older than N. Uses a ring buffer so memory for the emitted
+// lines is O(maxLines) regardless of file size.
 func (s *GtEventsSource) loadRecentEvents() {
 	const maxLines = 200
 
-	if _, err := s.file.Seek(0, 0); err != nil {
+	file := s.tailer.file
+	if _, err := file.Seek(0, 0); err != nil {
 		return
 	}
 
@@ -301,16 +308,18 @@ func (s *GtEventsSource) loadRecentEvents() {
 	idx := 0
 	count := 0
 
-	scanner := bufio.NewScanner(s.file)
+	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for scanner.Scan() {
-		ring[idx%maxLines] = scanner.Text()
+		line := scanner.Text()
+		s.tailer.observeLine(line)
+		ring[idx%maxLines] = line
 		idx++
 		count++
 	}
 	if scanner.Err() != nil {
 		// Scanner failed (e.g. token too long) — seek to EOF so tail starts clean
-		_, _ = s.file.Seek(0, 2)
+		_, _ = file.Seek(0, 2)
 		return
 	}
 
@@ -339,7 +348,8 @@ func (s *GtEventsSource) Events() <-chan Event {
 // Close stops the source
 func (s *GtEventsSource) Close() error {
 	s.cancel()
-	return s.file.Close()
+	<-s.done
+	return nil
 }
 
 // parseGtEventLine parses a line from .events.jsonl
