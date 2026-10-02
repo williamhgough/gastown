@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/steveyegge/gastown/internal/events"
 )
 
@@ -228,10 +229,21 @@ func (p *Pruner) Prune() (*PruneResult, error) {
 }
 
 // pruneFile prunes a single JSONL file.
+//
+// It holds the file's flock (<path>.lock, the lock events.Log and the feed
+// curator take around every append) from the read until the rename. Without
+// it, an event appended after the read lands in the old inode and the rename
+// discards it. Writers block for the duration of the rewrite.
 func (p *Pruner) pruneFile(filePath string) (result *PruneResult, err error) {
 	result = &PruneResult{
 		PrunedByType: make(map[string]int),
 	}
+
+	fl := flock.New(filePath + ".lock")
+	if err := fl.Lock(); err != nil {
+		return nil, fmt.Errorf("locking %s: %w", filepath.Base(filePath), err)
+	}
+	defer fl.Unlock() //nolint:errcheck // best-effort unlock
 
 	// Get file size before
 	info, err := os.Stat(filePath)
