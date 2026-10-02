@@ -1,6 +1,7 @@
 package feed
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"os"
@@ -384,5 +385,229 @@ func TestMatchesFilters(t *testing.T) {
 				t.Errorf("matchesFilters() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func tailTestEvent(t *testing.T, at time.Time, message string) string {
+	t.Helper()
+	b, err := json.Marshal(GtEvent{
+		Timestamp: at.Format(time.RFC3339), Source: "test", Type: "create",
+		Actor: "a", Visibility: "feed", Payload: map[string]interface{}{"message": message},
+	})
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+	return string(b) + "\n"
+}
+
+func appendToFile(t *testing.T, path, data string) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(data); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+}
+
+// replaceFile mimics gt krc prune: write a temp file, then rename it over path.
+func replaceFile(t *testing.T, path, data string) {
+	t.Helper()
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(data), 0644); err != nil {
+		t.Fatalf("write tmp: %v", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+}
+
+func newTestTailer(t *testing.T, path string) (*eventTailer, *[]string) {
+	t.Helper()
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	tail := newEventTailer(path, file)
+	t.Cleanup(tail.close)
+	// Like PrintGtEvents: read the file to the end, counting every line shown.
+	sc := bufio.NewScanner(file)
+	for sc.Scan() {
+		tail.observeLine(sc.Text())
+	}
+	tail.resumeAtOffsetOf(file)
+	got := &[]string{}
+	return tail, got
+}
+
+func pollMessages(t *testing.T, tail *eventTailer, got *[]string) []string {
+	t.Helper()
+	*got = nil
+	if err := tail.poll(func(e Event) { *got = append(*got, e.Message) }); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	return *got
+}
+
+func TestEventTailer_AppendReplaceAndTruncate(t *testing.T) {
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	path := filepath.Join(t.TempDir(), ".events.jsonl")
+	appendToFile(t, path, tailTestEvent(t, base, "one")+tailTestEvent(t, base.Add(time.Second), "two"))
+
+	tail, got := newTestTailer(t, path)
+
+	if m := pollMessages(t, tail, got); len(m) != 0 {
+		t.Fatalf("no new data: expected nothing, got %v", m)
+	}
+
+	appendToFile(t, path, tailTestEvent(t, base.Add(2*time.Second), "three"))
+	if m := pollMessages(t, tail, got); len(m) != 1 || !strings.Contains(m[0], "three") {
+		t.Fatalf("append: expected [three], got %v", m)
+	}
+
+	// Prune-style replace: retained history ("two", "three") plus an event that
+	// landed in the new file before the next poll ("four").
+	replaceFile(t, path,
+		tailTestEvent(t, base.Add(time.Second), "two")+
+			tailTestEvent(t, base.Add(2*time.Second), "three")+
+			tailTestEvent(t, base.Add(3*time.Second), "four"))
+	if m := pollMessages(t, tail, got); len(m) != 1 || !strings.Contains(m[0], "four") {
+		t.Fatalf("replace: expected only [four] (no repeats), got %v", m)
+	}
+
+	appendToFile(t, path, tailTestEvent(t, base.Add(4*time.Second), "five"))
+	if m := pollMessages(t, tail, got); len(m) != 1 || !strings.Contains(m[0], "five") {
+		t.Fatalf("append after replace: expected [five], got %v", m)
+	}
+
+	// Truncate in place (copytruncate style) and write fresh events.
+	if err := os.Truncate(path, 0); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	appendToFile(t, path, tailTestEvent(t, base.Add(5*time.Second), "six"))
+	if m := pollMessages(t, tail, got); len(m) != 1 || !strings.Contains(m[0], "six") {
+		t.Fatalf("truncate: expected [six], got %v", m)
+	}
+}
+
+func TestEventTailer_DrainsOldFileBeforeSwitching(t *testing.T) {
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	path := filepath.Join(t.TempDir(), ".events.jsonl")
+	appendToFile(t, path, tailTestEvent(t, base, "one"))
+
+	tail, got := newTestTailer(t, path)
+
+	// Appended to the old inode, then replaced before the tailer polled. The
+	// replacement does not contain it (the prune read the file earlier).
+	appendToFile(t, path, tailTestEvent(t, base.Add(time.Second), "late"))
+	replaceFile(t, path, tailTestEvent(t, base, "one"))
+
+	if m := pollMessages(t, tail, got); len(m) != 1 || !strings.Contains(m[0], "late") {
+		t.Fatalf("expected [late] from the old inode, got %v", m)
+	}
+}
+
+func TestEventTailer_ReassemblesSplitLine(t *testing.T) {
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	path := filepath.Join(t.TempDir(), ".events.jsonl")
+	appendToFile(t, path, tailTestEvent(t, base, "one"))
+
+	tail, got := newTestTailer(t, path)
+
+	line := tailTestEvent(t, base.Add(time.Second), "split")
+	appendToFile(t, path, line[:20])
+	if m := pollMessages(t, tail, got); len(m) != 0 {
+		t.Fatalf("half a line must not be emitted, got %v", m)
+	}
+	appendToFile(t, path, line[20:])
+	if m := pollMessages(t, tail, got); len(m) != 1 || !strings.Contains(m[0], "split") {
+		t.Fatalf("expected [split] once the line completes, got %v", m)
+	}
+}
+
+// A prune can retain lines whose timestamp does not parse. parseGtEventLine
+// stamps those with the read time, so a time-based dedup would reprint them
+// after every replace.
+func TestEventTailer_ReplaceDoesNotRepeatUnparseableTimestamp(t *testing.T) {
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	path := filepath.Join(t.TempDir(), ".events.jsonl")
+	badTS := `{"ts":"not-a-time","source":"test","type":"create","actor":"a","visibility":"feed","payload":{"message":"bad-ts"}}` + "\n"
+	appendToFile(t, path, badTS+tailTestEvent(t, base, "one"))
+
+	tail, got := newTestTailer(t, path)
+
+	replaceFile(t, path, badTS+tailTestEvent(t, base, "one")+tailTestEvent(t, base.Add(time.Second), "two"))
+	if m := pollMessages(t, tail, got); len(m) != 1 || !strings.Contains(m[0], "two") {
+		t.Fatalf("replace: expected only [two], got %v", m)
+	}
+
+	replaceFile(t, path, badTS+tailTestEvent(t, base, "one")+tailTestEvent(t, base.Add(time.Second), "two"))
+	if m := pollMessages(t, tail, got); len(m) != 0 {
+		t.Fatalf("second replace: expected nothing, got %v", m)
+	}
+}
+
+// Timestamps have one-second resolution, so a new event can be byte-identical
+// to an old one. It must still be shown, and the retained copy must not repeat.
+func TestEventTailer_ReplaceKeepsNewEventIdenticalToOldOne(t *testing.T) {
+	base := time.Now().Add(-time.Hour).Truncate(time.Second)
+	path := filepath.Join(t.TempDir(), ".events.jsonl")
+	same := tailTestEvent(t, base, "same")
+	appendToFile(t, path, same)
+
+	tail, got := newTestTailer(t, path)
+
+	// Replace keeps the old line, and the same line was logged again before
+	// the next poll.
+	replaceFile(t, path, same+same)
+	if m := pollMessages(t, tail, got); len(m) != 1 || !strings.Contains(m[0], "same") {
+		t.Fatalf("expected the second copy shown once, got %v", m)
+	}
+
+	replaceFile(t, path, same+same)
+	if m := pollMessages(t, tail, got); len(m) != 0 {
+		t.Fatalf("expected no repeats, got %v", m)
+	}
+}
+
+func TestPrintGtEvents_FollowSurvivesFileReplacement(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	dir := t.TempDir()
+	eventsPath := filepath.Join(dir, ".events.jsonl")
+	appendToFile(t, eventsPath, tailTestEvent(t, now, "initial"))
+
+	oldStdout := os.Stdout
+	r, w, _ := os.Pipe()
+	os.Stdout = w
+
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = PrintGtEvents(dir, PrintOptions{Limit: 100, Follow: true, Ctx: ctx})
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+	replaceFile(t, eventsPath, tailTestEvent(t, now, "initial"))
+	time.Sleep(500 * time.Millisecond)
+	appendToFile(t, eventsPath, tailTestEvent(t, now.Add(time.Second), "after-replace"))
+	time.Sleep(500 * time.Millisecond)
+	cancel()
+	wg.Wait()
+
+	w.Close()
+	os.Stdout = oldStdout
+	buf := make([]byte, 8192)
+	n, _ := r.Read(buf)
+	output := string(buf[:n])
+
+	if strings.Count(output, "initial") != 1 {
+		t.Errorf("initial event should print exactly once, got output: %q", output)
+	}
+	if !strings.Contains(output, "after-replace") {
+		t.Errorf("event appended after the file was replaced never streamed: %q", output)
 	}
 }
