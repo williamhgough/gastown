@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +21,7 @@ var (
 	beadCreateDescription     string
 	beadCreateDescriptionFile string
 	beadCreateLabels          []string
+	beadCreateExternalRef     string
 	beadCreateDryRun          bool
 )
 
@@ -53,8 +55,9 @@ func init() {
 	beadCreateCmd.Flags().StringVar(&beadCreateType, "type", "task", "Bead type (task, bug, feature, epic, chore)")
 	beadCreateCmd.Flags().StringVarP(&beadCreatePriority, "priority", "p", "2", "Priority 0-4")
 	beadCreateCmd.Flags().StringVarP(&beadCreateDescription, "description", "d", "", "Description text")
-	beadCreateCmd.Flags().StringVar(&beadCreateDescriptionFile, "description-file", "", "Read the description from a file")
+	beadCreateCmd.Flags().StringVar(&beadCreateDescriptionFile, "description-file", "", "Read the description from a file (- reads standard input)")
 	beadCreateCmd.Flags().StringArrayVar(&beadCreateLabels, "label", nil, "Label to add (repeatable)")
+	beadCreateCmd.Flags().StringVar(&beadCreateExternalRef, "external-ref", "", "Key of the outside item this bead tracks, looked up later with bd list --external-ref")
 	beadCreateCmd.Flags().BoolVar(&beadCreateDryRun, "dry-run", false, "Print the ID that would be used and create nothing")
 	beadCmd.AddCommand(beadCreateCmd)
 }
@@ -64,16 +67,9 @@ func runBeadCreate(cmd *cobra.Command, args []string) error {
 	if title == "" {
 		return fmt.Errorf("title must not be empty")
 	}
-	if beadCreateDescription != "" && beadCreateDescriptionFile != "" {
-		return fmt.Errorf("use --description or --description-file, not both")
-	}
-	description := beadCreateDescription
-	if beadCreateDescriptionFile != "" {
-		raw, err := os.ReadFile(beadCreateDescriptionFile)
-		if err != nil {
-			return fmt.Errorf("reading description file: %w", err)
-		}
-		description = string(raw)
+	description, err := readBeadDescription(beadCreateDescription, beadCreateDescriptionFile, cmd.InOrStdin())
+	if err != nil {
+		return err
 	}
 
 	townRoot, err := workspace.FindFromCwd()
@@ -92,6 +88,7 @@ func runBeadCreate(cmd *cobra.Command, args []string) error {
 		Priority:    beadCreatePriority,
 		Description: description,
 		Labels:      beadCreateLabels,
+		ExternalRef: beadCreateExternalRef,
 		DryRun:      beadCreateDryRun,
 	})
 	if err != nil {
@@ -99,6 +96,29 @@ func runBeadCreate(cmd *cobra.Command, args []string) error {
 	}
 	fmt.Println(id)
 	return nil
+}
+
+// readBeadDescription returns the description from --description, or from the
+// file named by --description-file ("-" reads stdin). The two are exclusive.
+func readBeadDescription(inline, file string, stdin io.Reader) (string, error) {
+	if inline != "" && file != "" {
+		return "", fmt.Errorf("use --description or --description-file, not both")
+	}
+	if file == "" {
+		return inline, nil
+	}
+	if file == "-" {
+		raw, err := io.ReadAll(stdin)
+		if err != nil {
+			return "", fmt.Errorf("reading description from stdin: %w", err)
+		}
+		return string(raw), nil
+	}
+	raw, err := os.ReadFile(file)
+	if err != nil {
+		return "", fmt.Errorf("reading description file: %w", err)
+	}
+	return string(raw), nil
 }
 
 // readableBeadSpec is what createReadableBead needs to make one bead.
@@ -109,7 +129,8 @@ type readableBeadSpec struct {
 	Priority    string
 	Description string
 	Labels      []string
-	DryRun      bool // build and return the ID, create nothing
+	ExternalRef string // optional key of the outside item this bead tracks
+	DryRun      bool   // build and return the ID, create nothing
 }
 
 // createReadableBead creates a bead in the beads database at targetDir under an
@@ -147,6 +168,9 @@ func createReadableBead(targetDir string, spec readableBeadSpec) (string, error)
 	}
 	for _, label := range spec.Labels {
 		createArgs = append(createArgs, "--label="+label)
+	}
+	if spec.ExternalRef != "" {
+		createArgs = append(createArgs, "--external-ref="+spec.ExternalRef)
 	}
 	if err := BdCmd(createArgs...).Dir(targetDir).WithAutoCommit().Run(); err != nil {
 		return "", fmt.Errorf("creating bead %s: %w", id, err)
