@@ -446,3 +446,73 @@ exit 0
 		t.Errorf("expected stdin to be multi-line, got %q", stdin)
 	}
 }
+
+// escalationStub writes a bd stub that answers `config get issue_prefix` with
+// "hq" and runs createBody for `bd create`. Each create appends its args as one
+// line to $LOG (<dir>/creates.log) before createBody runs, so createBody can
+// count earlier calls with `wc -l < "$LOG"`. It returns the stub's directory.
+func escalationStub(t *testing.T, createBody string) string {
+	t.Helper()
+	dir := t.TempDir()
+	script := `#!/bin/sh
+LOG="$(dirname "$0")/creates.log"
+if [ "$1" = "config" ] && [ "$2" = "get" ] && [ "$3" = "issue_prefix" ]; then echo hq; exit 0; fi
+if [ "$1" = "create" ]; then
+  echo "$*" >> "$LOG"
+  cat > /dev/null
+` + createBody + `
+fi
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(dir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	ResetBdAllowStaleCacheForTest()
+	return dir
+}
+
+const escalationIssueJSON = `{"id":"hq-wisp-x","title":"x","status":"open","priority":2,"type":"task","labels":["gt:escalation"]}`
+
+func TestCreateEscalationBead_UsesReadableID(t *testing.T) {
+	dir := escalationStub(t, `  echo '`+escalationIssueJSON+`'; exit 0`)
+
+	b := New(t.TempDir())
+	if _, err := b.CreateEscalationBead("[HIGH] Deploy failed in prod", &EscalationFields{Severity: "high"}); err != nil {
+		t.Fatalf("CreateEscalationBead: %v", err)
+	}
+	logged, _ := os.ReadFile(filepath.Join(dir, "creates.log"))
+	if !strings.Contains(string(logged), "--id=hq-wisp-deploy-failed-prod ") || !strings.Contains(string(logged), "--force") {
+		t.Errorf("bd create args = %q, want --id=hq-wisp-deploy-failed-prod with --force", string(logged))
+	}
+}
+
+func TestCreateEscalationBead_RetriesWhenReadableIDIsTaken(t *testing.T) {
+	dir := escalationStub(t, `  if [ "$(wc -l < "$LOG")" -le 1 ]; then
+    echo "Error: ID already exists; use bd update" >&2
+    exit 1
+  fi
+  echo '`+escalationIssueJSON+`'; exit 0`)
+
+	b := New(t.TempDir())
+	if _, err := b.CreateEscalationBead("[HIGH] Deploy failed in prod", &EscalationFields{Severity: "high"}); err != nil {
+		t.Fatalf("CreateEscalationBead should succeed on the second ID: %v", err)
+	}
+	logged, _ := os.ReadFile(filepath.Join(dir, "creates.log"))
+	lines := strings.Split(strings.TrimSpace(string(logged)), "\n")
+	if len(lines) != 2 || !strings.Contains(lines[1], "--id=hq-wisp-deploy-failed-prod-2 ") {
+		t.Errorf("create calls = %q, want a second call with --id=hq-wisp-deploy-failed-prod-2", lines)
+	}
+}
+
+func TestCreateEscalationBead_StillCreatesWhenEveryReadableIDIsTaken(t *testing.T) {
+	escalationStub(t, `  case "$*" in
+    *--id=*) echo "Error: ID already exists; use bd update" >&2; exit 1 ;;
+  esac
+  echo '`+escalationIssueJSON+`'; exit 0`)
+
+	b := New(t.TempDir())
+	if _, err := b.CreateEscalationBead("[HIGH] Deploy failed in prod", &EscalationFields{Severity: "high"}); err != nil {
+		t.Fatalf("an escalation must never be lost to a taken ID: %v", err)
+	}
+}

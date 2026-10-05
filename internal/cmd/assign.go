@@ -110,28 +110,18 @@ func runAssign(_ *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Step 1: Create the bead
-	createArgs := []string{"create", "--title=" + title, "--type=" + assignType, "--priority=" + assignPriority, "--silent"}
-	if assignDescription != "" {
-		createArgs = append(createArgs, "--description="+assignDescription)
-	}
-	for _, l := range assignLabels {
-		createArgs = append(createArgs, "--label="+l)
-	}
-
+	// Step 1: Create the bead, named for the work (hq-fix-auth-token-refresh)
 	fmt.Printf("%s Creating bead for %s...\n", style.Bold.Render("📋"), agentID)
 
-	out, err := BdCmd(createArgs...).
-		Dir(townRoot).
-		WithAutoCommit().
-		Output()
+	beadID, err := createReadableBead(townRoot, readableBeadSpec{
+		Title:       title,
+		Type:        assignType,
+		Priority:    assignPriority,
+		Description: assignDescription,
+		Labels:      assignLabels,
+	})
 	if err != nil {
 		return fmt.Errorf("creating bead: %w", err)
-	}
-
-	beadID := strings.TrimSpace(string(out))
-	if beadID == "" {
-		return fmt.Errorf("bd create returned empty ID")
 	}
 
 	fmt.Printf("  Created: %s\n", beadID)

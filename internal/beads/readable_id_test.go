@@ -131,3 +131,23 @@ func TestReadableIDPropagatesLookupError(t *testing.T) {
 		t.Errorf("ReadableID() error = %v, want it to wrap %v", err, lookupErr)
 	}
 }
+
+func TestReadableIDTreatsParenthesisedPluralAsPlural(t *testing.T) {
+	got, err := ReadableID("hq", "", "Intake: 2 new item(s)", neverTaken)
+	if err != nil {
+		t.Fatalf("ReadableID() error = %v", err)
+	}
+	if want := "hq-intake-2-new-item"; got != want {
+		t.Errorf("ReadableID() = %q, want %q", got, want)
+	}
+}
+
+func TestReadableKindIDSkipsBracketedTags(t *testing.T) {
+	got, err := ReadableKindID("hq", "wisp", "[MEDIUM] gt dog done command fails with 'gt done is for polecats only' error")
+	if err != nil {
+		t.Fatalf("ReadableKindID() error = %v", err)
+	}
+	if want := "hq-wisp-gt-dog-done-command-fails"; got != want {
+		t.Errorf("ReadableKindID() = %q, want %q", got, want)
+	}
+}

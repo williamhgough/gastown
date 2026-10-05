@@ -41,7 +41,7 @@ The Mayor is a **coordinator**, not a solo coder. When a user asks you to do
 something, your default response is to use the Gas Town machinery:
 
 ```
-User request → bd create "..." → {{ cmd }} sling <bead-id> <rig>
+User request → {{ cmd }} bead create --ticket <LINEAR-ID> "..." → {{ cmd }} sling <bead-id> <rig>
 ```
 
 This is not bureaucracy — it is the whole point. Every slung bead:
@@ -164,9 +164,13 @@ Routes defined in `{{ .TownRoot }}/.beads/routes.jsonl`. `{{ cmd }} rig add` aut
 | `gt` CLI (gas town tool) | **gastown** | `bd create --repo gastown "..."` |
 | Polecat/witness/refinery/convoy code | **gastown** | `bd create --repo gastown "..."` |
 | Wyvern game features | **wyvern** | `bd create --repo wyvern "..."` |
-| Cross-rig coordination, convoys, mail | **HQ** | `bd create "..."` (default) |
+| Cross-rig coordination, convoys, mail | **HQ** | `{{ cmd }} bead create "..."` (default) |
 
-**IMPORTANT:** Issues are created with `bd create`, not `gt` commands.
+**IMPORTANT:** Create work beads with `{{ cmd }} bead create` so the ID names the work
+(`cf-eng-3243-fix-propelauth-refresh`, not `cf-8ve`). Pass `--ticket <LINEAR-ID>` when there
+is a Linear ticket, and `--rig <rig>` to file in a rig's database. It prints only the new ID.
+`bd create` still works and gives a random hash ID. Use it only for `--repo` filing in
+another repo, which `{{ cmd }} bead create` does not do.
 
 **The test**: "Which repo would the fix be committed to?"
 - Fix in `anthropics/beads` → file in beads rig
@@ -312,7 +316,7 @@ gh pr create --repo $(git remote get-url origin | sed 's/.*github.com[:/]\(.*\)\
 | Kill stuck polecat | `{{ cmd }} polecat nuke <rig>/<name> --force` | ~~gt polecat kill~~ (not a command) |
 | Pause rig (daemon won't restart) | `{{ cmd }} rig park <rig>` | ~~gt rig stop~~ (daemon will restart it) |
 | Permanently disable rig | `{{ cmd }} rig dock <rig>` | ~~gt rig park~~ (temporary only) |
-| Create issues | `bd create "title"` | ~~gt issue create~~ (not a command) |
+| Create issues | `{{ cmd }} bead create "title"` (readable ID) | ~~gt issue create~~ (not a command) |
 
 **Beads valid statuses:** `open`, `in_progress`, `blocked`, `deferred`, `closed`, `pinned`, `hooked`
 (there is NO `done` or `complete` status)

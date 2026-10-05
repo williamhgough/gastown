@@ -390,15 +390,22 @@ func TestSendFromCrewWorkspace_AvoidsEphemeralPrefixMismatch(t *testing.T) {
 	}
 
 	// Stub bd to reproduce the old behavior where --id msg-* with --ephemeral
-	// would fail prefix validation before ephemeral handling.
-	// The fix: sendToSingle no longer passes --id to bd create.
+	// would fail prefix validation before ephemeral handling. sendToSingle never
+	// passes the in-memory msg-* ID; it passes an ID built from the database
+	// prefix, which the stub accepts only when it starts with "hq-".
 	binDir := filepath.Join(tmpDir, "bin")
+	createLog := filepath.Join(tmpDir, "create-args.log")
 	if err := os.MkdirAll(binDir, 0755); err != nil {
 		t.Fatalf("mkdir bin: %v", err)
 	}
 	bdStub := filepath.Join(binDir, "bd")
 	script := `#!/usr/bin/env bash
 set -euo pipefail
+
+if [[ "${1:-}" == "config" && "${2:-}" == "get" && "${3:-}" == "issue_prefix" ]]; then
+  echo "hq"
+  exit 0
+fi
 
 if [[ "${1:-}" == "config" || "${1:-}" == "init" ]]; then
   exit 0
@@ -415,6 +422,7 @@ if [[ "${1:-}" == "mol" && "${2:-}" == "wisp" && "${3:-}" == "list" ]]; then
 fi
 
 if [[ "${1:-}" == "create" ]]; then
+  echo "$*" >> "` + createLog + `"
   has_ephemeral=false
   msg_id=""
   i=1
@@ -431,7 +439,7 @@ if [[ "${1:-}" == "create" ]]; then
     ((i++))
   done
 
-  if [[ "$has_ephemeral" == "true" && "$msg_id" == msg-* ]]; then
+  if [[ -n "$msg_id" && "$msg_id" != hq-* ]]; then
     echo "prefix mismatch: database uses 'hq-' (allowed: hq,hq-cv) but ID '$msg_id' doesn't match any allowed prefix" >&2
     exit 1
   fi
@@ -460,6 +468,17 @@ exit 1
 
 	if err := r.Send(msg); err != nil {
 		t.Fatalf("send from crew workspace should succeed without prefix mismatch: %v", err)
+	}
+
+	logged, err := os.ReadFile(createLog)
+	if err != nil {
+		t.Fatalf("read create log: %v", err)
+	}
+	if !strings.Contains(string(logged), "--id=hq-wisp-test-message ") || !strings.Contains(string(logged), "--force") {
+		t.Errorf("bd create args = %q, want --id=hq-wisp-test-message with --force", string(logged))
+	}
+	if strings.Contains(string(logged), "--id=msg-") {
+		t.Errorf("bd create args = %q, must not pass the in-memory msg- ID", string(logged))
 	}
 }
 
@@ -2281,5 +2300,117 @@ func TestEnqueueReplyReminder_DisabledByConfig(t *testing.T) {
 	pending, _ := nudge.Pending(townRoot, "gt-gastown-crew-bob")
 	if pending != 0 {
 		t.Errorf("reply_reminder_delay=0s should disable reminders, got %d pending", pending)
+	}
+}
+
+// mailTestTown builds a minimal town with a bd stub on PATH and returns the
+// sender directory. createScript is the body that handles "bd create"; the stub
+// answers `config get issue_prefix` itself.
+func mailTestTown(t *testing.T, createScript string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("test uses a bash bd stub")
+	}
+	tmpDir := t.TempDir()
+	townRoot := filepath.Join(tmpDir, "town")
+	senderDir := filepath.Join(townRoot, "barnaby", "crew", "tom")
+	recipientDir := filepath.Join(townRoot, "barnaby", "crew", "troy")
+	mayorDir := filepath.Join(townRoot, "mayor")
+	townBeadsDir := filepath.Join(townRoot, ".beads")
+	for _, dir := range []string{senderDir, recipientDir, mayorDir, townBeadsDir} {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(townBeadsDir, "beads.db"), []byte{}, 0644); err != nil {
+		t.Fatalf("write beads.db: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(mayorDir, "town.json"), []byte(`{"name":"test"}`), 0644); err != nil {
+		t.Fatalf("write town.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(townBeadsDir, ".gt-types-configured"), []byte(beads.TypeConfigSentinelValue()+"\n"), 0644); err != nil {
+		t.Fatalf("write types sentinel: %v", err)
+	}
+	binDir := filepath.Join(tmpDir, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+	script := `#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "config" && "${2:-}" == "get" && "${3:-}" == "issue_prefix" ]]; then echo hq; exit 0; fi
+if [[ "${1:-}" == "config" || "${1:-}" == "init" ]]; then exit 0; fi
+if [[ "${1:-}" == "list" ]]; then echo "[]"; exit 0; fi
+if [[ "${1:-}" == "mol" && "${2:-}" == "wisp" && "${3:-}" == "list" ]]; then echo "[]"; exit 0; fi
+if [[ "${1:-}" == "create" ]]; then
+` + createScript + `
+fi
+echo "unsupported bd args: $*" >&2
+exit 1
+`
+	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return senderDir
+}
+
+func TestSend_RetriesReadableIDWhenTaken(t *testing.T) {
+	counter := filepath.Join(t.TempDir(), "creates")
+	senderDir := mailTestTown(t, `
+  n=$(cat "`+counter+`" 2>/dev/null || echo 0)
+  n=$((n+1))
+  echo "$n" > "`+counter+`"
+  if [[ $n -le 2 ]]; then
+    echo "Error: ID already exists; use bd update, or bd import for upsert semantics" >&2
+    exit 1
+  fi
+  echo "$*" > "`+counter+`.args"
+  echo "hq-testmail-1"
+  exit 0`)
+
+	msg := &Message{From: "barnaby/crew/tom", To: "barnaby/troy", Subject: "Intake: 0 new item(s)", Body: "x", Wisp: true, SuppressNotify: true}
+	if err := NewRouter(senderDir).Send(msg); err != nil {
+		t.Fatalf("send should succeed after two taken IDs: %v", err)
+	}
+	args, err := os.ReadFile(counter + ".args")
+	if err != nil {
+		t.Fatalf("read args: %v", err)
+	}
+	if !strings.Contains(string(args), "--id=hq-wisp-intake-0-new-item-3 ") {
+		t.Errorf("third create args = %q, want --id=hq-wisp-intake-0-new-item-3", string(args))
+	}
+}
+
+func TestSend_FallsBackToGeneratedIDWhenEveryReadableIDIsTaken(t *testing.T) {
+	senderDir := mailTestTown(t, `
+  for arg in "$@"; do
+    if [[ "$arg" == --id=* ]]; then
+      echo "Error: ${arg#--id=} already exists; use bd update" >&2
+      exit 1
+    fi
+  done
+  echo "hq-testmail-1"
+  exit 0`)
+
+	msg := &Message{From: "barnaby/crew/tom", To: "barnaby/troy", Subject: "Intake: 0 new item(s)", Body: "x", Wisp: true, SuppressNotify: true}
+	if err := NewRouter(senderDir).Send(msg); err != nil {
+		t.Fatalf("a taken readable ID must never fail a send: %v", err)
+	}
+}
+
+func TestSend_DoesNotRetryOnOtherBdErrors(t *testing.T) {
+	counter := filepath.Join(t.TempDir(), "creates")
+	senderDir := mailTestTown(t, `
+  echo x >> "`+counter+`"
+  echo "failed to connect to dolt server" >&2
+  exit 1`)
+
+	msg := &Message{From: "barnaby/crew/tom", To: "barnaby/troy", Subject: "Hello there", Body: "x", Wisp: true, SuppressNotify: true}
+	if err := NewRouter(senderDir).Send(msg); err == nil {
+		t.Fatal("send should fail when bd cannot reach the database")
+	}
+	logged, _ := os.ReadFile(counter)
+	if got := strings.Count(string(logged), "x"); got != 1 {
+		t.Errorf("bd create ran %d times, want 1: only a duplicate ID may be retried", got)
 	}
 }

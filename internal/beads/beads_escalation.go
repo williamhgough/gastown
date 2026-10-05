@@ -202,9 +202,35 @@ func (b *Beads) CreateEscalationBead(title string, fields *EscalationFields) (*I
 		args = append(args, "--actor="+actor)
 	}
 
-	out, err := b.runWithStdin([]byte(description), args...)
+	// Name the escalation for what it is about (hq-wisp-gt-dog-done-command-fails).
+	// An escalation must never be lost to an ID problem, so when no readable ID can
+	// be built bd picks one.
+	var out []byte
+	create := func(id string) error {
+		createArgs := append([]string{}, args...)
+		if id != "" {
+			createArgs = append(createArgs, "--id="+id)
+			if NeedsForceForID(id) {
+				createArgs = append(createArgs, "--force")
+			}
+		}
+		var runErr error
+		out, runErr = b.runWithStdin([]byte(description), createArgs...)
+		return runErr
+	}
+
+	prefix, err := b.IssuePrefix()
 	if err != nil {
 		return nil, err
+	}
+	var createErr error
+	if baseID, idErr := ReadableKindID(prefix, "wisp", title); idErr != nil {
+		createErr = create("")
+	} else {
+		_, createErr = CreateUnderReadableID(baseID, time.Now(), create)
+	}
+	if createErr != nil {
+		return nil, createErr
 	}
 
 	var issue Issue
@@ -213,6 +239,20 @@ func (b *Beads) CreateEscalationBead(title string, fields *EscalationFields) (*I
 	}
 
 	return &issue, nil
+}
+
+// IssuePrefix returns the issue prefix of the database this Beads talks to,
+// without a trailing hyphen (for example "hq").
+func (b *Beads) IssuePrefix() (string, error) {
+	out, err := b.run("config", "get", "issue_prefix")
+	if err != nil {
+		return "", fmt.Errorf("reading the bead ID prefix: %w", err)
+	}
+	prefix := strings.TrimSuffix(strings.TrimSpace(string(out)), "-")
+	if prefix == "" {
+		return "", fmt.Errorf("beads database has no issue_prefix")
+	}
+	return prefix, nil
 }
 
 // AckEscalation acknowledges an escalation bead.

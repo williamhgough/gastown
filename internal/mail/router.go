@@ -48,6 +48,9 @@ type Router struct {
 	IdleNotifyTimeout time.Duration
 
 	notifyWg sync.WaitGroup // tracks in-flight async notifications
+
+	prefixMu    sync.Mutex
+	issuePrefix map[string]string // beadsDir -> issue prefix, so a send does not ask bd every time
 }
 
 // NewRouter creates a new mail router.
@@ -1156,19 +1159,17 @@ func (r *Router) sendToSingle(msg *Message) error {
 	// Add actor for attribution (sender identity)
 	args = append(args, "--actor", msg.From)
 
-	// Do NOT pass --id to bd create. The msg.ID (msg-xxx prefix) is for
-	// in-memory tracking only. bd auto-generates IDs with the correct
-	// database prefix (e.g., hq-wisp-xxx). Passing --id causes prefix
-	// mismatch errors when the msg- prefix does not match the database.
+	// The msg.ID (msg-xxx prefix) is for in-memory tracking only and is never
+	// passed to bd. The bead ID is built below from the database prefix and the
+	// subject (hq-wisp-intake-2-new-item), so a person can tell what a message is
+	// from its ID. It always uses the database's own prefix, so there is no prefix
+	// mismatch, and it falls back to bd's generated ID rather than fail a send.
+	isWisp := r.shouldBeWisp(msg)
 
 	// Add --ephemeral flag for ephemeral messages (wisps, not synced to git)
-	if r.shouldBeWisp(msg) {
+	if isWisp {
 		args = append(args, "--ephemeral")
 	}
-
-	// End flag parsing with --, then add subject as positional argument.
-	// This prevents subjects like "--help" or "--json" from being parsed as flags.
-	args = append(args, "--", msg.Subject)
 
 	beadsDir := r.resolveBeadsDir()
 	if err := r.ensureCustomTypes(beadsDir); err != nil {
@@ -1176,7 +1177,31 @@ func (r *Router) sendToSingle(msg *Message) error {
 	}
 	ctx, cancel := bdWriteCtx()
 	defer cancel()
-	_, err := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
+
+	create := func(id string) error {
+		createArgs := append([]string{}, args...)
+		if id != "" {
+			createArgs = append(createArgs, "--id="+id)
+			if beads.NeedsForceForID(id) {
+				createArgs = append(createArgs, "--force")
+			}
+		}
+		// End flag parsing with --, then add subject as positional argument.
+		// This prevents subjects like "--help" or "--json" from being parsed as flags.
+		createArgs = append(createArgs, "--", msg.Subject)
+		_, err := runBdCommand(ctx, createArgs, filepath.Dir(beadsDir), beadsDir)
+		return err
+	}
+
+	baseID, err := r.readableMessageID(ctx, beadsDir, msg.Subject, isWisp)
+	if err != nil {
+		return err
+	}
+	if baseID == "" {
+		err = create("")
+	} else {
+		_, err = beads.CreateUnderReadableID(baseID, time.Now(), create)
+	}
 	telemetry.RecordMailMessage(context.Background(), "send", telemetry.MailMessageInfo{
 		ID:       msg.ID,
 		From:     msg.From,
@@ -1207,6 +1232,48 @@ func (r *Router) sendToSingle(msg *Message) error {
 	}
 
 	return nil
+}
+
+// readableMessageID returns the first ID to try for a message: <prefix>-wisp-<subject>
+// for ephemeral messages and <prefix>-mail-<subject> for the rest. It returns ""
+// when the subject has no usable words, meaning bd should pick the ID.
+func (r *Router) readableMessageID(ctx context.Context, beadsDir, subject string, isWisp bool) (string, error) {
+	prefix, err := r.databasePrefix(ctx, beadsDir)
+	if err != nil {
+		return "", err
+	}
+	kind := "mail"
+	if isWisp {
+		kind = "wisp"
+	}
+	id, err := beads.ReadableKindID(prefix, kind, subject)
+	if err != nil {
+		return "", nil
+	}
+	return id, nil
+}
+
+// databasePrefix reads the issue prefix of the beads database at beadsDir. The
+// answer is cached per directory: it does not change while the router lives.
+func (r *Router) databasePrefix(ctx context.Context, beadsDir string) (string, error) {
+	r.prefixMu.Lock()
+	defer r.prefixMu.Unlock()
+	if prefix, ok := r.issuePrefix[beadsDir]; ok {
+		return prefix, nil
+	}
+	out, err := runBdCommand(ctx, []string{"config", "get", "issue_prefix"}, filepath.Dir(beadsDir), beadsDir)
+	if err != nil {
+		return "", fmt.Errorf("reading the bead ID prefix from %s: %w", beadsDir, err)
+	}
+	prefix := strings.TrimSuffix(strings.TrimSpace(string(out)), "-")
+	if prefix == "" {
+		return "", fmt.Errorf("beads database at %s has no issue_prefix", beadsDir)
+	}
+	if r.issuePrefix == nil {
+		r.issuePrefix = make(map[string]string)
+	}
+	r.issuePrefix[beadsDir] = prefix
+	return prefix, nil
 }
 
 // sendToList expands a mailing list and sends individual copies to each recipient.

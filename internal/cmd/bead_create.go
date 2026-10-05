@@ -85,46 +85,73 @@ func runBeadCreate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	prefixOut, err := BdCmd("config", "get", "issue_prefix").Dir(targetDir).Output()
-	if err != nil {
-		return fmt.Errorf("reading the bead ID prefix from %s: %w", targetDir, err)
-	}
-	prefix := strings.TrimSpace(string(prefixOut))
-
-	id, err := beads.ReadableID(prefix, beadCreateTicket, title, func(candidate string) (bool, error) {
-		return beadExists(targetDir, candidate)
+	id, err := createReadableBead(targetDir, readableBeadSpec{
+		Title:       title,
+		Ticket:      beadCreateTicket,
+		Type:        beadCreateType,
+		Priority:    beadCreatePriority,
+		Description: description,
+		Labels:      beadCreateLabels,
+		DryRun:      beadCreateDryRun,
 	})
 	if err != nil {
 		return err
 	}
+	fmt.Println(id)
+	return nil
+}
 
-	if beadCreateDryRun {
-		fmt.Println(id)
-		return nil
+// readableBeadSpec is what createReadableBead needs to make one bead.
+type readableBeadSpec struct {
+	Title       string
+	Ticket      string // optional tracker ID such as ENG-3243; else found in the title
+	Type        string
+	Priority    string
+	Description string
+	Labels      []string
+	DryRun      bool // build and return the ID, create nothing
+}
+
+// createReadableBead creates a bead in the beads database at targetDir under an
+// ID built from the ticket and title, and returns that ID.
+func createReadableBead(targetDir string, spec readableBeadSpec) (string, error) {
+	prefixOut, err := BdCmd("config", "get", "issue_prefix").Dir(targetDir).Output()
+	if err != nil {
+		return "", fmt.Errorf("reading the bead ID prefix from %s: %w", targetDir, err)
+	}
+	prefix := strings.TrimSpace(string(prefixOut))
+
+	id, err := beads.ReadableID(prefix, spec.Ticket, spec.Title, func(candidate string) (bool, error) {
+		return beadExists(targetDir, candidate)
+	})
+	if err != nil {
+		return "", err
+	}
+	if spec.DryRun {
+		return id, nil
 	}
 
 	createArgs := []string{
 		"create",
 		"--id=" + id,
-		"--title=" + title,
-		"--type=" + beadCreateType,
-		"--priority=" + beadCreatePriority,
+		"--title=" + spec.Title,
+		"--type=" + spec.Type,
+		"--priority=" + spec.Priority,
 		"--silent",
 	}
 	if beads.NeedsForceForID(id) {
 		createArgs = append(createArgs, "--force")
 	}
-	if description != "" {
-		createArgs = append(createArgs, "--description="+description)
+	if spec.Description != "" {
+		createArgs = append(createArgs, "--description="+spec.Description)
 	}
-	for _, label := range beadCreateLabels {
+	for _, label := range spec.Labels {
 		createArgs = append(createArgs, "--label="+label)
 	}
 	if err := BdCmd(createArgs...).Dir(targetDir).WithAutoCommit().Run(); err != nil {
-		return fmt.Errorf("creating bead %s: %w", id, err)
+		return "", fmt.Errorf("creating bead %s: %w", id, err)
 	}
-	fmt.Println(id)
-	return nil
+	return id, nil
 }
 
 // beadCreateTargetDir picks the directory whose beads database receives the bead.
