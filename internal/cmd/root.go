@@ -189,13 +189,16 @@ func isRoleCommand(cmd *cobra.Command) bool {
 	return false
 }
 
+// isDoneCommand reports whether cmd is the top-level `gt done`, the polecat-only
+// command. Other subcommands that are also named "done" (gt dog done, gt mol step
+// done, gt wl done) are not: they belong to other roles and must not be held to
+// the polecat worktree guard.
 func isDoneCommand(cmd *cobra.Command) bool {
-	for c := cmd; c != nil; c = c.Parent() {
-		if c.Name() == "done" {
-			return true
-		}
+	if cmd == nil || cmd.Name() != "done" {
+		return false
 	}
-	return false
+	parent := cmd.Parent()
+	return parent == nil || parent.Parent() == nil
 }
 
 // initCLITheme initializes the CLI color theme based on settings and environment.

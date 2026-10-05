@@ -376,3 +376,37 @@ func doneGuardGitOutput(t *testing.T, dir string, args ...string) string {
 	}
 	return string(output)
 }
+
+// Only the top-level `gt done` is the polecat command. Other subcommands that
+// happen to be named "done" must not hit its polecat-only worktree guard.
+func TestIsDoneCommandIgnoresNestedDoneSubcommands(t *testing.T) {
+	root := &cobra.Command{Use: "gt"}
+	topLevelDone := &cobra.Command{Use: "done"}
+	dog := &cobra.Command{Use: "dog"}
+	dogDone := &cobra.Command{Use: "done [name]"}
+	mol := &cobra.Command{Use: "mol"}
+	step := &cobra.Command{Use: "step"}
+	stepDone := &cobra.Command{Use: "done <step-id>"}
+	wl := &cobra.Command{Use: "wl"}
+	wlDone := &cobra.Command{Use: "done <wanted-id>"}
+
+	root.AddCommand(topLevelDone, dog, mol, wl)
+	dog.AddCommand(dogDone)
+	mol.AddCommand(step)
+	step.AddCommand(stepDone)
+	wl.AddCommand(wlDone)
+
+	if !isDoneCommand(topLevelDone) {
+		t.Error("gt done should be detected")
+	}
+	for name, cmd := range map[string]*cobra.Command{
+		"gt dog done":      dogDone,
+		"gt mol step done": stepDone,
+		"gt wl done":       wlDone,
+		"gt dog":           dog,
+	} {
+		if isDoneCommand(cmd) {
+			t.Errorf("%s must not be treated as the polecat-only gt done", name)
+		}
+	}
+}
