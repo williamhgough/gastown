@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    beads.url = "github:gastownhall/beads";
+    beads.url = "github:gastownhall/beads/v1.3.1";
   };
 
   outputs =
@@ -24,11 +24,11 @@
       in
       {
         packages = {
-          gt = pkgs.buildGoModule {
+          gt = pkgs.buildGo127Module {
             pname = "gt";
             version = "1.0.0";
             src = ./.;
-            vendorHash = "sha256-mJzpsl4XnIm3ZSg7fFn0MOdQQW1bdOkAJ+TikiLMXJM=";
+            vendorHash = "sha256-KMeBz8px0GfAmUmlgzctn2w12MYcZISMXOAeqJvyd+4=";
 
             ldflags = [
               "-X github.com/gastownhall/gastown/internal/cmd.Build=nix"
@@ -36,6 +36,7 @@
             ];
 
             subPackages = [ "cmd/gt" ];
+            buildInputs = [ pkgs.icu ];
 
             meta = with pkgs.lib; {
               description = "Multi-agent orchestration system for Claude Code with persistent work tracking";
@@ -57,7 +58,7 @@
         devShells.default = pkgs.mkShell {
           buildInputs = [
             beadsPkg
-            pkgs.go_1_25
+            pkgs.go_1_27
             pkgs.gopls
             pkgs.gotools
             pkgs.go-tools
